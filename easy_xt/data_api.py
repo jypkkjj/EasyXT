@@ -24,6 +24,7 @@ xtdata.download_history_data2() 和 download_history_data() 方法在并发调�
 """
 
 import logging
+import math
 import pandas as pd
 from typing import Union, List, Optional, Dict, Any
 from datetime import datetime, timedelta
@@ -448,6 +449,30 @@ def auto_time_range(days: int = 10) -> tuple[str, str]:
     
     return start_time, end_time
 
+
+def minute_download_range(start, end, period, count, now=None):
+    """Choose a minute-cache download window without truncating an explicit query.
+
+    A count query ignores start, as get_price does. The count-derived window
+    allows for weekends and ordinary holidays, but upstream availability still
+    determines how many bars can actually be returned.
+    """
+    end_day = datetime.strptime(end, '%Y%m%d') if end else (now or datetime.now())
+    if count is None and start:
+        return start, end_day.strftime('%Y%m%d')
+
+    if count is not None:
+        if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+            raise ValueError("count 必须是正整数")
+        minutes_per_bar = int(period[:-1])
+        bars_per_session = max(1, 240 // minutes_per_bar)
+        sessions = math.ceil(count / bars_per_session)
+        calendar_days = max(10, sessions * 3 + 7)
+    else:
+        calendar_days = 10
+    start_day = end_day - timedelta(days=calendar_days)
+    return start_day.strftime('%Y%m%d'), end_day.strftime('%Y%m%d')
+
 def validate_stock_codes(codes: Union[str, List[str]]) -> tuple[bool, str]:
     """验证股票代码有效性"""
     if isinstance(codes, str):
@@ -712,6 +737,7 @@ class DataAPI:
 
         # 尝试每个数据源，直到成功或全部失败
         last_error = None
+        source_errors = []
         for source_name, source_method in sources_to_try:
             try:
                 if source_name != self._active_source:
@@ -734,18 +760,20 @@ class DataAPI:
 
             except (ConnectionError, DataError) as e:
                 last_error = e
+                source_errors.append(f"{source_name.upper()}: {e}")
                 if source_name != self._active_source:
                     logger.warning(f"[WARN] {source_name.upper()} 数据源失败: {e}")
                 continue
             except Exception as e:
                 last_error = e
+                source_errors.append(f"{source_name.upper()}: {e}")
                 if source_name != self._active_source:
                     logger.warning(f"[WARN] {source_name.upper()} 数据源异常: {e}")
                 continue
 
         # 所有数据源都失败
         if last_error:
-            raise last_error
+            raise DataError("所有数据源均未返回价格数据。" + " | ".join(source_errors)) from last_error
         else:
             raise ConnectionError("数据服务未连接，请先调用init_data()")
 
@@ -763,6 +791,8 @@ class DataAPI:
 
         # 处理时间参数
         from datetime import datetime
+        requested_count = count
+        explicit_start_date = TimeUtils.normalize_date(start) if start and requested_count is None else None
         if count:
             end_date = TimeUtils.normalize_date(end) if end else datetime.now().strftime('%Y%m%d')
             start_date = ''
@@ -828,18 +858,18 @@ class DataAPI:
                 try:
                     logger.info(f"正在下载 {codes} 的历史数据...")
 
-                    # 对于分钟数据，限制时间范围避免数据量过大
+                    # 分钟数据尊重显式日期；count 模式按K线数量估算窗口。
                     if period in ['1m', '5m', '15m', '30m']:
-                        # 分钟数据只下载最近几天
-                        from datetime import timedelta
-                        end_dt = datetime.now()
-                        start_dt = end_dt - timedelta(days=3)  # 只下载最近3天
-                        download_start = start_dt.strftime('%Y%m%d')
-                        download_end = end_dt.strftime('%Y%m%d')
+                        download_start, download_end = minute_download_range(
+                            explicit_start_date,
+                            end_date, period, requested_count,
+                        )
                     else:
                         download_start = start_date if start_date else '20200101'
                         download_end = end_date if end_date else datetime.now().strftime('%Y%m%d')
 
+                    logger.info("QMT %s 请求下载 %s 至 %s 的 %s 数据 (count=%s)",
+                                codes, download_start, download_end, period, requested_count)
                     # 使用线程锁保护下载操作，防止并发调用导致卡死
                     with DataAPI._download_lock:
                         self._call_qmt('download_history_data2',
@@ -848,7 +878,7 @@ class DataAPI:
                             start_time=download_start,
                             end_time=download_end
                         )
-                    logger.info("历史数据下载完成")
+                    logger.info("QMT历史数据下载请求已返回；正在核验本地K线")
 
                     # 下载后重新获取数据
                     data = self._call_qmt('get_market_data_ex',
@@ -862,11 +892,16 @@ class DataAPI:
                         fill_data=config.get('data.fill_data', True)
                     )
                 except Exception as download_error:
-                    logger.info(f"数据下载警告: {download_error}")
+                    logger.warning("QMT历史数据下载/核验异常: %s", download_error)
                     # 下载失败不影响后续获取，可能本地已有数据
             
             if not data:
-                raise DataError("xtquant返回空数据，可能是网络问题或股票代码错误")
+                requested_start = download_start if 'download_start' in locals() else start_date
+                requested_end = download_end if 'download_end' in locals() else end_date
+                raise DataError(
+                    f"QMT无法获取股票 {codes} 的 {period} 数据；"
+                    f"请求区间 {requested_start} 至 {requested_end}，下载后仍无K线。"
+                )
             
             # 检查是否所有字段都是空的
             all_empty = True
@@ -876,10 +911,15 @@ class DataAPI:
                     break
             
             if all_empty:
+                requested_start = download_start if 'download_start' in locals() else start_date
+                requested_end = download_end if 'download_end' in locals() else end_date
+                logger.warning("QMT %s %s 在请求区间 %s 至 %s 后仍无K线",
+                               codes, period, requested_start, requested_end)
                 _log_missing_qmt_history(codes)
                 # 抛出异常让降级机制处理
                 raise DataError(
-                    f"无法获取股票 {codes} 的数据。\n\n"
+                    f"QMT无法获取股票 {codes} 的 {period} 数据；"
+                    f"请求区间 {requested_start} 至 {requested_end}，下载后仍无K线。\n\n"
                     f"🔧 快速解决方案（推荐）：\n"
                     f"1️⃣ 使用项目提供的一键下载工具：\n"
                     f"   cd tools\n"
@@ -1900,7 +1940,7 @@ class DataAPI:
         return results
     
     @ErrorHandler.handle_api_error
-    def get_price_robust(self, 
+    def get_price_robust(self,
                         codes: Union[str, List[str]], 
                         start: Optional[str] = None, 
                         end: Optional[str] = None, 
@@ -1951,6 +1991,8 @@ class DataAPI:
         # normalize_codes 已经能够正确处理字符串（包括逗号分隔的字符串）和列表
         codes = StockCodeUtils.normalize_codes(codes)
         
+        requested_count = count
+        explicit_start_date = TimeUtils.normalize_date(start) if start and requested_count is None else None
         # 智能时间范围处理
         if count:
             end_date = TimeUtils.normalize_date(end) if end else datetime.now().strftime('%Y%m%d')
@@ -2023,14 +2065,18 @@ class DataAPI:
                     try:
                         logger.info(f"正在下载 {codes} 的历史数据... (第{attempt+1}次尝试)")
 
-                        # 对于分钟数据，限制时间范围避免数据量过大
+                        # 分钟数据尊重显式日期；count 模式按K线数量估算窗口。
                         if period in ['1m', '5m', '15m', '30m']:
-                            # 分钟数据只下载最近几天
-                            download_start, download_end = auto_time_range(3)
+                            download_start, download_end = minute_download_range(
+                                explicit_start_date,
+                                end_date, period, requested_count,
+                            )
                         else:
                             download_start = start_date if start_date else '20200101'
                             download_end = end_date if end_date else datetime.now().strftime('%Y%m%d')
 
+                        logger.info("QMT %s 请求下载 %s 至 %s 的 %s 数据 (count=%s)",
+                                    codes, download_start, download_end, period, requested_count)
                         # 使用线程锁保护下载操作，防止并发调用导致卡死
                         with DataAPI._download_lock:
                             self._call_qmt('download_history_data2',
@@ -2039,7 +2085,7 @@ class DataAPI:
                                 start_time=download_start,
                                 end_time=download_end
                             )
-                        logger.info("历史数据下载完成")
+                        logger.info("QMT历史数据下载请求已返回；正在核验本地K线")
 
                         # 下载后重新获取数据
                         data = self._call_qmt('get_market_data_ex',
@@ -2057,7 +2103,12 @@ class DataAPI:
                         # 下载失败不影响后续获取，可能本地已有数据
                 
                 if not data:
-                    raise DataError("xtquant返回空数据，可能是网络问题或股票代码错误")
+                    requested_start = download_start if 'download_start' in locals() else start_date
+                    requested_end = download_end if 'download_end' in locals() else end_date
+                    raise DataError(
+                        f"QMT无法获取股票 {codes} 的 {period} 数据；"
+                        f"请求区间 {requested_start} 至 {requested_end}，下载后仍无K线。"
+                    )
                 
                 # 检查是否所有字段都是空的
                 all_empty = True

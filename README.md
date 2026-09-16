@@ -520,6 +520,16 @@ data = api.get_price('000001.SZ', count=100)
 print(data.head())
 ```
 
+分钟K线（`1m`、`5m`、`15m`、`30m`）首次读取会先查 QMT 本地缓存；
+缓存为空时，指定 `start`/`end` 的查询会按该日期范围请求下载，不再固定为最近三天。
+使用 `count` 时会按周期和条数估算包含周末的下载窗口；不指定日期或条数时默认请求最近十个自然日。
+窗口是下载请求范围，不保证 QMT 上游一定有足够的K线；下载后若仍为空，错误会写明实际请求区间。
+
+```python
+bars = api.get_price('002714.SZ', period='1m', count=100)
+history = api.get_price('002714.SZ', start='20260901', end='20260914', period='1m')
+```
+
 #### 简单交易示例
 
 ```python
